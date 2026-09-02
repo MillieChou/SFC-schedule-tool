@@ -219,45 +219,210 @@ def make_excel(result: pd.DataFrame) -> bytes:
 
 
 st.title("🔍製令排程表核對小工具")
-st.caption("上傳每日生管排程，系統會自動整理發料日、原 IN 日、最新料件 IN 日與入庫日。")
+st.caption("上傳「前一日」與「今日」生管排程，系統會自動整理並核對發料日、料件 IN 日與入庫日的異動。")
 
-uploaded_file = st.file_uploader("📂 上傳生管排程 Excel", type=["xlsx", "xlsm", "xls"])
 
-if uploaded_file is None:
-    st.info("請先上傳生管排程 Excel。")
+def normalize_date_value(value) -> pd.Timestamp | None:
+    if pd.isna(value):
+        return None
+    parsed = pd.to_datetime(value, errors="coerce")
+    return None if pd.isna(parsed) else parsed.normalize()
+
+
+def date_text(value) -> str:
+    parsed = normalize_date_value(value)
+    return "" if parsed is None else parsed.strftime("%Y/%m/%d")
+
+
+def compare_schedules(previous: pd.DataFrame, current: pd.DataFrame) -> pd.DataFrame:
+    """以製令比對前一日與今日排程，顯示真正跨日的異動。"""
+    previous_map = previous.drop_duplicates("製令", keep="last").set_index("製令")
+    current_map = current.drop_duplicates("製令", keep="last").set_index("製令")
+
+    rows: list[dict[str, object]] = []
+    all_orders = list(dict.fromkeys(list(current_map.index) + list(previous_map.index)))
+
+    for order_no in all_orders:
+        in_previous = order_no in previous_map.index
+        in_current = order_no in current_map.index
+
+        if in_current:
+            current_row = current_map.loc[order_no]
+            record = current_row.to_dict()
+            record["製令"] = order_no
+        else:
+            previous_row = previous_map.loc[order_no]
+            record = previous_row.to_dict()
+            record["製令"] = order_no
+
+        changes: list[str] = []
+
+        if not in_previous and in_current:
+            change_status = "🆕 今日新增"
+        elif in_previous and not in_current:
+            change_status = "🗑️ 今日排程已移除"
+        else:
+            previous_row = previous_map.loc[order_no]
+            current_row = current_map.loc[order_no]
+
+            compare_fields = [
+                ("發料日", "發料日"),
+                ("料件IN日", "IN日"),
+                ("入庫日", "入庫日"),
+            ]
+            for field, label in compare_fields:
+                old_value = date_text(previous_row.get(field))
+                new_value = date_text(current_row.get(field))
+                if old_value != new_value:
+                    old_display = old_value or "空白"
+                    new_display = new_value or "空白"
+                    changes.append(f"{label} {old_display} → {new_display}")
+
+            change_status = "🔄 " + "；".join(changes) if changes else "➖ 無異動"
+
+        record["排程異動"] = change_status
+        rows.append(record)
+
+    result = pd.DataFrame(rows)
+    preferred = ["製令", "發料日", "原IN日", "料件IN日", "入庫日", "IN安排狀態", "排程異動"]
+    for col in preferred:
+        if col not in result.columns:
+            result[col] = ""
+    return result[preferred]
+
+
+def make_compare_excel(result: pd.DataFrame) -> bytes:
+    buffer = BytesIO()
+    result.to_excel(buffer, index=False, sheet_name="每日排程核對結果", engine="openpyxl")
+    buffer.seek(0)
+    workbook = load_workbook(buffer)
+    sheet = workbook["每日排程核對結果"]
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = sheet.dimensions
+
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    for cell in sheet[1]:
+        cell.fill = header_fill
+        cell.font = Font(color="FFFFFF", bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    header_map = {cell.value: cell.column for cell in sheet[1]}
+    for column_name in ("發料日", "原IN日", "料件IN日", "入庫日"):
+        column_index = header_map.get(column_name)
+        if column_index:
+            for row_index in range(2, sheet.max_row + 1):
+                sheet.cell(row_index, column_index).number_format = "yyyy/mm/dd"
+
+    change_column = header_map.get("排程異動")
+    if change_column:
+        fills = {
+            "🆕": PatternFill("solid", fgColor="E2F0D9"),
+            "🗑️": PatternFill("solid", fgColor="E7E6E6"),
+            "🔄": PatternFill("solid", fgColor="FFF2CC"),
+        }
+        for row_index in range(2, sheet.max_row + 1):
+            cell = sheet.cell(row_index, change_column)
+            text_value = str(cell.value or "")
+            for prefix, fill in fills.items():
+                if text_value.startswith(prefix):
+                    cell.fill = fill
+                    break
+
+    widths = [18, 13, 13, 13, 13, 16, 55]
+    for index, width in enumerate(widths, start=1):
+        sheet.column_dimensions[sheet.cell(1, index).column_letter].width = width
+
+    output = BytesIO()
+    workbook.save(output)
+    return output.getvalue()
+
+
+col_prev, col_today = st.columns(2)
+with col_prev:
+    previous_file = st.file_uploader(
+        "📂 前一日生管排程",
+        type=["xlsx", "xlsm", "xls"],
+        key="previous_schedule",
+    )
+with col_today:
+    current_file = st.file_uploader(
+        "📂 今日生管排程",
+        type=["xlsx", "xlsm", "xls"],
+        key="current_schedule",
+    )
+
+if previous_file is None or current_file is None:
+    st.info("請同時上傳「前一日」與「今日」生管排程，才能核對異動。")
 else:
     try:
-        file_bytes = uploaded_file.getvalue()
-        excel = pd.ExcelFile(BytesIO(file_bytes))
-        sheet_name = st.selectbox("工作表", excel.sheet_names, index=0)
+        previous_bytes = previous_file.getvalue()
+        current_bytes = current_file.getvalue()
 
-        if st.button("🔍 開始整理", type="secondary", use_container_width=False):
-            with st.spinner("正在整理生管排程..."):
-                result = analyze_schedule(BytesIO(file_bytes), sheet_name)
-            st.session_state["sfc_result"] = result
-            st.session_state["sfc_source_name"] = uploaded_file.name
+        previous_excel = pd.ExcelFile(BytesIO(previous_bytes))
+        current_excel = pd.ExcelFile(BytesIO(current_bytes))
 
-        result = st.session_state.get("sfc_result")
-        if result is not None:
-            counts = result["IN安排狀態"].value_counts()
+        col1, col2 = st.columns(2)
+        with col1:
+            previous_sheet = st.selectbox(
+                "前一日工作表",
+                previous_excel.sheet_names,
+                index=0,
+                key="previous_sheet",
+            )
+        with col2:
+            current_sheet = st.selectbox(
+                "今日工作表",
+                current_excel.sheet_names,
+                index=0,
+                key="current_sheet",
+            )
+
+        if st.button("🔍 開始核對", type="secondary", use_container_width=False):
+            with st.spinner("正在整理並核對兩日生管排程..."):
+                previous_result = analyze_schedule(BytesIO(previous_bytes), previous_sheet)
+                current_result = analyze_schedule(BytesIO(current_bytes), current_sheet)
+                compare_result = compare_schedules(previous_result, current_result)
+
+            st.session_state["sfc_compare_result"] = compare_result
+            st.session_state["sfc_current_result"] = current_result
+
+        compare_result = st.session_state.get("sfc_compare_result")
+        current_result = st.session_state.get("sfc_current_result")
+
+        if compare_result is not None and current_result is not None:
+            changed_mask = compare_result["排程異動"].str.startswith("🔄", na=False)
+            added_mask = compare_result["排程異動"].str.startswith("🆕", na=False)
+            removed_mask = compare_result["排程異動"].str.startswith("🗑️", na=False)
+
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("全部製令", len(result))
-            c2.metric("⚪ 尚未安排", int(counts.get("⚪ 尚未安排", 0)))
-            c3.metric("🟢 已安排", int(counts.get("🟢 已安排", 0)))
-            c4.metric("🟠 已重排", int(counts.get("🟠 已重排", 0)))
+            c1.metric("今日全部製令", len(current_result))
+            c2.metric("🔄 今日異動", int(changed_mask.sum()))
+            c3.metric("🆕 今日新增", int(added_mask.sum()))
+            c4.metric("🗑️ 今日移除", int(removed_mask.sum()))
 
-            st.subheader("整理結果")
-            display_df = result.copy()
-            for column in ("發料日", "原IN日", "料件IN日", "入庫日"):
-                display_df[column] = display_df[column].dt.strftime("%Y/%m/%d").fillna("")
-            st.dataframe(display_df, use_container_width=True, hide_index=True)
+            important_mask = changed_mask | added_mask | removed_mask
+            if important_mask.any():
+                st.warning(f"⚠️ 今日共有 {int(important_mask.sum())} 筆排程與前一日不同，請優先確認。")
+                st.subheader("⚠️ 今日異動")
+                changed_df = compare_result.loc[important_mask].copy()
+                for column in ("發料日", "原IN日", "料件IN日", "入庫日"):
+                    changed_df[column] = pd.to_datetime(changed_df[column], errors="coerce").dt.strftime("%Y/%m/%d").fillna("")
+                st.dataframe(changed_df, use_container_width=True, hide_index=True)
+            else:
+                st.success("✅ 今日排程與前一日相比，發料日、料件 IN 日及入庫日皆無異動。")
 
-            excel_bytes = make_excel(result)
+            with st.expander("📋 查看全部核對結果"):
+                display_df = compare_result.copy()
+                for column in ("發料日", "原IN日", "料件IN日", "入庫日"):
+                    display_df[column] = pd.to_datetime(display_df[column], errors="coerce").dt.strftime("%Y/%m/%d").fillna("")
+                st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+            excel_bytes = make_compare_excel(compare_result)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             st.download_button(
-                "📥 下載整理結果 Excel",
+                "📥 下載每日排程核對結果",
                 data=excel_bytes,
-                file_name=f"IN日期整理結果_{timestamp}.xlsx",
+                file_name=f"製令排程核對結果_{timestamp}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 type="secondary",
             )
