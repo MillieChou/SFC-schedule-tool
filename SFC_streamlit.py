@@ -11,7 +11,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
 
-st.set_page_config(page_title="生管排程 IN 日期整理工具", page_icon="📅", layout="wide")
+st.set_page_config(page_title="製令排程表核對小工具", page_icon="🔍", layout="wide")
 
 FIELD_ALIASES = {
     "製令": ("製令", "製令號碼", "製令編號"),
@@ -218,7 +218,7 @@ def make_excel(result: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
-st.title("📅 生管排程 IN 日期整理工具")
+st.title("🔍製令排程表核對小工具")
 st.caption("上傳每日生管排程，系統會自動整理發料日、原 IN 日、最新料件 IN 日與入庫日。")
 
 uploaded_file = st.file_uploader("📂 上傳生管排程 Excel", type=["xlsx", "xlsm", "xls"])
@@ -231,7 +231,7 @@ else:
         excel = pd.ExcelFile(BytesIO(file_bytes))
         sheet_name = st.selectbox("工作表", excel.sheet_names, index=0)
 
-        if st.button("🔍 開始整理", type="primary", use_container_width=False):
+        if st.button("🔍 開始整理", type="secondary", use_container_width=False):
             with st.spinner("正在整理生管排程..."):
                 result = analyze_schedule(BytesIO(file_bytes), sheet_name)
             st.session_state["sfc_result"] = result
@@ -259,7 +259,7 @@ else:
                 data=excel_bytes,
                 file_name=f"IN日期整理結果_{timestamp}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary",
+                type="secondary",
             )
     except Exception as error:
         st.error(f"處理失敗：{error}")
